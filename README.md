@@ -17,10 +17,6 @@ The device is discovered by the ESPHome integration; enter `bluetti__api_key` fr
 when asked. Numeric sensors show "unknown" while the Bluetti link is down, and the switches/select
 report no state. Use the `BLE connection` switch to release the station for the phone app.
 
-Migrating from the MQTT firmware: stop the old firmware first, delete the old MQTT `Bluetti AC180P`
-device in HA (otherwise the new entities get a `_2` suffix), and clear the retained
-`homeassistant/+/<mac6>/+/config` and `bluetti/<mac6>/#` topics from the broker.
-
 ## Build with the ESPHome desktop app
 
 1. Install the app from https://desktop.esphome.io/.

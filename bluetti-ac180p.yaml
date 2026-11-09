@@ -44,7 +44,7 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  power_save_mode: light
+  power_save_mode: none
   reboot_timeout: 5min
 
 debug:
@@ -73,7 +73,7 @@ ble_client:
             p.latency = 0;
             p.timeout = 400;  // 4 s supervision timeout
             esp_ble_gap_update_conn_params(&p);
-            esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+            esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
     on_disconnect:
       then:
         - lambda: bluetti::client.on_disconnect();
@@ -126,7 +126,7 @@ select:
       - Silent
       - Standard
       - Turbo
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: |-
       if (!bluetti::client.live()) return {};
       std::string m = bluetti::client.mode_label();
@@ -161,7 +161,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: "%"
     accuracy_decimals: 0
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.soc();
   - platform: template
     name: Input power
@@ -169,7 +169,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.in_w();
   - platform: template
     name: Output power
@@ -177,7 +177,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.out_w();
   - platform: template
     name: Net power
@@ -185,7 +185,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.net_w();
   - platform: template
     name: AC input power
@@ -193,7 +193,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.ac_in();
   - platform: template
     name: DC input power
@@ -201,7 +201,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.dc_in();
   - platform: template
     name: AC output power
@@ -209,7 +209,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.ac_out();
   - platform: template
     name: DC output power
@@ -217,7 +217,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.dc_out();
   - platform: template
     name: AC input voltage
@@ -225,7 +225,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: V
     accuracy_decimals: 1
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.ac_in_v();
   - platform: template
     name: Time remaining
@@ -233,7 +233,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: h
     accuracy_decimals: 1
-    update_interval: 20000ms
+    update_interval: 5000ms
     lambda: return bluetti::client.time_h();
 
   # Diagnostics

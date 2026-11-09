@@ -18,7 +18,7 @@ namespace bluetti {
 
 static const char *const TAG = "bluetti";
 
-static const uint32_t POLL_MS = 20000;     // one full read cycle per period
+static const uint32_t POLL_MS = 5000;     // one full read cycle per period
 static const uint32_t TIMEOUT_MS = 3000;  // per request
 static const uint32_t SETTLE_MS = 1500;   // let the notify subscription finish after connect
 static const uint8_t MAX_FAILS = 3;       // consecutive failed core requests before dropping the link
