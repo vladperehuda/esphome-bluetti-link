@@ -1,0 +1,273 @@
+# Bluetti AC180P -> Home Assistant over the ESPHome native API.
+# All the Modbus-over-BLE logic lives in bluetti_ac180p.h; the entities below just read from it.
+
+substitutions:
+  name: bluetti
+  friendly_name: Bluetti AC180P
+  ble_service: 0000ff00-0000-1000-8000-00805f9b34fb
+  ble_notify: 0000ff01-0000-1000-8000-00805f9b34fb
+  ble_write: 0000ff02-0000-1000-8000-00805f9b34fb
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  includes:
+    - bluetti_ac180p.h
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Reboot on a stalled loop: the WiFi/API reboot_timeouts only help when the loop still runs.
+      CONFIG_ESP_TASK_WDT_PANIC: "y"
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
+      CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0: "y"
+      CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1: "y"
+      # Keep the BLE host/controller off core 0, where WiFi and the main loop run (the old
+      # PlatformIO firmware pinned NimBLE to core 1 too).
+      CONFIG_BT_BLUEDROID_PINNED_TO_CORE_1: "y"
+      CONFIG_BTDM_CTRL_PINNED_TO_CORE_1: "y"
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret bluetti__api_key
+  reboot_timeout: 90s
+
+ota:
+  - platform: esphome
+    encryption:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: light
+  reboot_timeout: 5min
+
+debug:
+  update_interval: 60s
+
+# Scan lightly so WiFi keeps its share of the shared radio (the old firmware used ~20% duty).
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 320ms
+    window: 30ms
+    active: false
+
+ble_client:
+  - id: bluetti_ble
+    mac_address: !secret bluetti__bluetti_mac
+    on_connect:
+      then:
+        - esp32_ble_tracker.stop_scan:
+        - lambda: |-
+            bluetti::client.on_connect(millis());
+            // 60-120 ms to leave airtime for WiFi on the shared radio.
+            esp_ble_conn_update_params_t p = {};
+            memcpy(p.bda, id(bluetti_ble)->get_remote_bda(), sizeof(esp_bd_addr_t));
+            p.min_int = 48;   // 60 ms
+            p.max_int = 96;   // 120 ms
+            p.latency = 0;
+            p.timeout = 400;  // 4 s supervision timeout
+            esp_ble_gap_update_conn_params(&p);
+            esp_coex_preference_set(ESP_COEX_PREFER_WIFI);
+    on_disconnect:
+      then:
+        - lambda: bluetti::client.on_disconnect();
+        - esp32_ble_tracker.start_scan:
+            continuous: true  # the action defaults to one 5 min scan; reconnecting needs scanning to stay on
+
+switch:
+  - platform: ble_client
+    ble_client_id: bluetti_ble
+    id: bluetti_link
+    name: BLE connection
+    entity_category: config
+
+  # restore_mode DISABLED: never replay a stored state as a command to the station on boot.
+  - platform: template
+    name: AC output
+    restore_mode: DISABLED
+    lambda: |-
+      if (!bluetti::client.live()) return {};
+      return bluetti::client.ac_on();
+    turn_on_action:
+      - lambda: bluetti::client.set_ac(true);
+    turn_off_action:
+      - lambda: bluetti::client.set_ac(false);
+  - platform: template
+    name: DC output
+    restore_mode: DISABLED
+    lambda: |-
+      if (!bluetti::client.live()) return {};
+      return bluetti::client.dc_on();
+    turn_on_action:
+      - lambda: bluetti::client.set_dc(true);
+    turn_off_action:
+      - lambda: bluetti::client.set_dc(false);
+  - platform: template
+    name: Power lifting
+    restore_mode: DISABLED
+    lambda: |-
+      if (!bluetti::client.live()) return {};
+      return bluetti::client.lift_on();
+    turn_on_action:
+      - lambda: bluetti::client.set_lift(true);
+    turn_off_action:
+      - lambda: bluetti::client.set_lift(false);
+
+select:
+  - platform: template
+    name: Charge mode
+    options:
+      - Silent
+      - Standard
+      - Turbo
+    update_interval: 20000ms
+    lambda: |-
+      if (!bluetti::client.live()) return {};
+      std::string m = bluetti::client.mode_label();
+      if (m.empty()) return {};
+      return m;
+    set_action:
+      - lambda: bluetti::client.set_mode(x);
+
+binary_sensor:
+  - platform: template
+    name: Bluetti link
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: return bluetti::client.live();
+
+sensor:
+  # Dummy sensor that only exists to subscribe to ff01 and hand the raw bytes to the lambda.
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: bluetti_ble
+    name: Bluetti RX
+    internal: true
+    service_uuid: ${ble_service}
+    characteristic_uuid: ${ble_notify}
+    notify: true
+    update_interval: never
+    lambda: return bluetti::client.on_notify(x);
+
+  - platform: template
+    name: Battery
+    device_class: battery
+    state_class: measurement
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    update_interval: 20000ms
+    lambda: return bluetti::client.soc();
+  - platform: template
+    name: Input power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: W
+    accuracy_decimals: 0
+    update_interval: 20000ms
+    lambda: return bluetti::client.in_w();
+  - platform: template
+    name: Output power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: W
+    accuracy_decimals: 0
+    update_interval: 20000ms
+    lambda: return bluetti::client.out_w();
+  - platform: template
+    name: Net power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: W
+    accuracy_decimals: 0
+    update_interval: 20000ms
+    lambda: return bluetti::client.net_w();
+  - platform: template
+    name: AC input power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: W
+    accuracy_decimals: 0
+    update_interval: 20000ms
+    lambda: return bluetti::client.ac_in();
+  - platform: template
+    name: DC input power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: W
+    accuracy_decimals: 0
+    update_interval: 20000ms
+    lambda: return bluetti::client.dc_in();
+  - platform: template
+    name: AC output power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: W
+    accuracy_decimals: 0
+    update_interval: 20000ms
+    lambda: return bluetti::client.ac_out();
+  - platform: template
+    name: DC output power
+    device_class: power
+    state_class: measurement
+    unit_of_measurement: W
+    accuracy_decimals: 0
+    update_interval: 20000ms
+    lambda: return bluetti::client.dc_out();
+  - platform: template
+    name: AC input voltage
+    device_class: voltage
+    state_class: measurement
+    unit_of_measurement: V
+    accuracy_decimals: 1
+    update_interval: 20000ms
+    lambda: return bluetti::client.ac_in_v();
+  - platform: template
+    name: Time remaining
+    device_class: duration
+    state_class: measurement
+    unit_of_measurement: h
+    accuracy_decimals: 1
+    update_interval: 20000ms
+    lambda: return bluetti::client.time_h();
+
+  # Diagnostics
+  - platform: wifi_signal
+    name: WiFi signal
+    update_interval: 30s
+  - platform: debug
+    free:
+      name: Free heap
+  - platform: uptime
+    name: Uptime
+    entity_category: diagnostic
+
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: Reset reason
+      entity_category: diagnostic
+
+interval:
+  # Request pump: one Modbus request in flight at a time.
+  - interval: 1000ms
+    then:
+      - if:
+          condition:
+            lambda: return bluetti::client.take_disconnect();
+          then:
+            - ble_client.disconnect: bluetti_ble
+      - if:
+          condition:
+            lambda: return bluetti::client.prepare_next(millis());
+          then:
+            - ble_client.ble_write:
+                id: bluetti_ble
+                service_uuid: ${ble_service}
+                characteristic_uuid: ${ble_write}
+                value: !lambda return bluetti::client.tx;
