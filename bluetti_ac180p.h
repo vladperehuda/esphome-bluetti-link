@@ -1,12 +1,11 @@
 #pragma once
-// Plain Modbus-RTU over BLE for the Bluetti AC180P.
+// Plain Modbus-RTU over BLE for the Bluetti AC180P (transport: bluetti_ble.h).
 // Values and command setters are consumed by the template entities in bluetti-ac180p.yaml
 // (ESPHome native API; no MQTT).
 
-#include <esp_coexist.h>
-
 #include <cmath>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,10 +17,10 @@ namespace bluetti {
 
 static const char *const TAG = "bluetti";
 
-static const uint32_t POLL_MS = 5000;     // one full read cycle per period
-static const uint32_t TIMEOUT_MS = 3000;  // per request
-static const uint32_t SETTLE_MS = 1500;   // let the notify subscription finish after connect
-static const uint8_t MAX_FAILS = 3;       // consecutive failed core requests before dropping the link
+static const uint32_t TIMEOUT_MS = 6000;  // per request; replies get slow while WiFi hogs the radio
+static const uint32_t SETTLE_MS = 200;    // after connect (the notify subscription is already confirmed)
+static const uint32_t STALE_MS = 90000;   // data older than this reads as unknown (the link is only up briefly)
+static const uint8_t MAX_FAILS = 6;       // consecutive failed core requests before dropping the link
 static const size_t WRITE_Q = 4;
 
 static const uint16_t REG_AC_OUT = 2011;
@@ -36,14 +35,12 @@ struct Step {
 };
 
 static const Step STEPS[] = {
-    {102, 1, true},   // SoC %
+    // Adjacent registers are read together to keep BLE airtime low.
+    {102, 3, true},   // SoC % at +0, time remaining (minutes) at +2
     {140, 7, true},   // dc_out, ac_out, dc_in, ac_in at +0, +2, +4, +6 (W)
     {1314, 1, true},  // AC input voltage, /10
-    {REG_AC_OUT, 1, true},
-    {REG_DC_OUT, 1, true},
-    {104, 1, false},  // time remaining, minutes
-    {REG_CHARGE_MODE, 1, false},
-    {REG_POWER_LIFTING, 1, false},
+    {REG_AC_OUT, 2, true},  // ac_on at +0, dc_on at +1; last core step of a cycle
+    {REG_CHARGE_MODE, 2, false},  // charge mode at +0, power lifting at +1
 };
 static const uint8_t N_STEPS = sizeof(STEPS) / sizeof(STEPS[0]);
 
@@ -64,22 +61,43 @@ inline uint16_t crc16(const uint8_t *d, size_t n) {
 
 class Client {
  public:
-  std::vector<uint8_t> tx;  // frame handed to ble_client.ble_write
+  std::vector<uint8_t> tx;  // frame to write to ff02 (only touched by the BLE task)
 
   // ---- link events -------------------------------------------------------------------------
   void on_connect(uint32_t now) {
+    std::lock_guard<std::mutex> lock(mtx_);
     reset_();
     connected_ = true;
     connected_ms_ = now;
     step_ = 0;
-    cycle_ms_ = now;
   }
   void on_disconnect() {
+    std::lock_guard<std::mutex> lock(mtx_);
     reset_();
     connected_ = false;
-    has_data_ = false;
+  }
+  // True once every request of the current cycle (and any queued write) has been answered.
+  bool cycle_done() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return connected_ && !busy_ && writes_.empty() && step_ >= N_STEPS && !want_disconnect_;
+  }
+  // Starts the next read cycle on an open link (persistent mode).
+  void begin_cycle() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (connected_ && !busy_) step_ = 0;
+  }
+  bool has_pending_writes() {
+    std::lock_guard<std::mutex> lock(mtx_);
+    return !writes_.empty();
+  }
+  // Commands are only accepted while the link is enabled; releasing it drops the queued ones.
+  void set_accept_writes(bool on) {
+    std::lock_guard<std::mutex> lock(mtx_);
+    accept_writes_ = on;
+    if (!on) writes_.clear();
   }
   bool take_disconnect() {
+    std::lock_guard<std::mutex> lock(mtx_);
     if (!want_disconnect_ || disconnect_sent_) return false;
     disconnect_sent_ = true;
     return true;
@@ -88,6 +106,7 @@ class Client {
   // ---- request scheduling ------------------------------------------------------------------
   // Returns true when `tx` holds a frame to write. One request in flight at a time.
   bool prepare_next(uint32_t now) {
+    std::lock_guard<std::mutex> lock(mtx_);
     if (!connected_ || want_disconnect_ || now - connected_ms_ < SETTLE_MS) return false;
     if (busy_) {
       if (now - sent_ms_ < TIMEOUT_MS) return false;
@@ -99,21 +118,19 @@ class Client {
     if (!writes_.empty()) {
       auto w = writes_.front();
       writes_.erase(writes_.begin());
+      step_ = 0;  // read everything back once the write is answered
       return send_(0x06, w.first, w.second, now, false);
     }
     if (step_ < N_STEPS) {
       const Step &s = STEPS[step_++];
       return send_(0x03, s.reg, s.qty, now, s.core);
     }
-    if (now - cycle_ms_ >= POLL_MS) {
-      step_ = 0;
-      cycle_ms_ = now;
-    }
-    return false;
+    return false;  // cycle finished; the BLE task drops the link (see cycle_done)
   }
 
   bool queue_write(uint16_t reg, uint16_t value) {
-    if (!connected_ || writes_.size() >= WRITE_Q) return false;
+    std::lock_guard<std::mutex> lock(mtx_);
+    if (!accept_writes_ || writes_.size() >= WRITE_Q) return false;
     writes_.push_back({reg, value});
     return true;
   }
@@ -122,20 +139,25 @@ class Client {
   // Called with every notification fragment from ff01. Always returns NAN (the ESPHome sensor
   // that hosts this lambda is a dummy; the data is kept here).
   float on_notify(const std::vector<uint8_t> &x) {
+    std::lock_guard<std::mutex> lock(mtx_);
     if (!busy_) return NAN;
     rx_.insert(rx_.end(), x.begin(), x.end());
     if (rx_.size() < 2) return NAN;
     const bool exc = rx_[1] & 0x80;
     const size_t need = exc ? 5 : (pend_fn_ == 0x03 ? 2u * pend_qty_ + 5u : 8u);
     if (rx_.size() < need) return NAN;  // wait for the remaining fragments
-    busy_ = false;
 
     const uint16_t crc = (uint16_t) (rx_[need - 2] | (rx_[need - 1] << 8));
     if (rx_[0] != 0x01 || crc != crc16(rx_.data(), need - 2)) {
-      ESP_LOGW(TAG, "bad frame for reg %u (len %u)", pend_reg_, (unsigned) rx_.size());
-      fail_(pend_core_);
+      // Most likely a late reply to an earlier request; keep waiting for ours (the timeout
+      // still counts the failure if it never comes).
+      ESP_LOGW(TAG, "stale/bad frame while waiting for reg %u (len %u), ignored", pend_reg_,
+               (unsigned) rx_.size());
+      rx_.clear();
       return NAN;
     }
+    busy_ = false;
+    ESP_LOGD(TAG, "reg %u answered in %u ms", pend_reg_, (unsigned) (millis() - sent_ms_));
     if (exc) {
       ESP_LOGW(TAG, "modbus exception %02x for reg %u", rx_[2], pend_reg_);
       fail_(pend_core_);
@@ -153,9 +175,9 @@ class Client {
   }
 
   // ---- values for the template entities ----------------------------------------------------
-  // Numeric getters return NAN while the link is down or no full cycle has completed yet, which
+  // Numeric getters return NAN while no full cycle has completed recently, which
   // Home Assistant shows as "unknown" instead of a stale or zero reading.
-  bool live() const { return connected_ && has_data_; }
+  bool live() const { return has_data_ && millis() - data_ms_ < STALE_MS; }
   float soc() const { return live() ? (float) soc_ : NAN; }
   float ac_in() const { return live() ? (float) ac_in_ : NAN; }
   float dc_in() const { return live() ? (float) dc_in_ : NAN; }
@@ -188,9 +210,13 @@ class Client {
   }
 
  private:
+  // Guards the request state: the NimBLE task and the ESPHome main loop (template entities) both call in.
+  std::mutex mtx_;
   // link
   bool connected_ = false;
   bool has_data_ = false;
+  bool accept_writes_ = true;
+  uint32_t data_ms_ = 0;
   bool want_disconnect_ = false;
   bool disconnect_sent_ = false;
   uint32_t connected_ms_ = 0;
@@ -203,7 +229,6 @@ class Client {
   uint16_t pend_reg_ = 0, pend_qty_ = 0;
   bool pend_core_ = false;
   uint8_t step_ = N_STEPS;
-  uint32_t cycle_ms_ = 0;
   uint8_t fails_ = 0;
   // values
   uint16_t soc_ = 0, dc_out_ = 0, ac_out_ = 0, dc_in_ = 0, ac_in_ = 0;
@@ -217,7 +242,6 @@ class Client {
 
   void reset_() {
     rx_.clear();
-    writes_.clear();
     busy_ = false;
     fails_ = 0;
     want_disconnect_ = false;
@@ -250,8 +274,10 @@ class Client {
   void store_(const uint8_t *d) {
     auto r = [d](int i) { return (uint16_t) ((d[2 * i] << 8) | d[2 * i + 1]); };
     switch (pend_reg_) {
-      case 102: soc_ = r(0); break;
-      case 104: time_h_ = r(0) / 60.0f; break;
+      case 102:
+        soc_ = r(0);
+        time_h_ = r(2) / 60.0f;
+        break;
       case 140:
         dc_out_ = r(0);
         ac_out_ = r(2);
@@ -259,13 +285,16 @@ class Client {
         ac_in_ = r(6);
         break;
       case 1314: ac_in_v_ = r(0) / 10.0f; break;
-      case REG_AC_OUT: ac_on_ = r(0) == 1; break;
-      case REG_DC_OUT:
-        dc_on_ = r(0) == 1;
-        has_data_ = true;  // last core register of a cycle
+      case REG_AC_OUT:
+        ac_on_ = r(0) == 1;
+        dc_on_ = r(1) == 1;
+        has_data_ = true;  // last core request of a cycle
+        data_ms_ = millis();
         break;
-      case REG_CHARGE_MODE: mode_ = r(0); break;
-      case REG_POWER_LIFTING: lift_ = r(0) == 1; break;
+      case REG_CHARGE_MODE:
+        mode_ = r(0);
+        lift_ = r(1) == 1;
+        break;
     }
   }
 };

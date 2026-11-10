@@ -1,36 +1,61 @@
 # Bluetti AC180P -> Home Assistant over the ESPHome native API.
-# All the Modbus-over-BLE logic lives in bluetti_ac180p.h; the entities below just read from it.
+# The Modbus protocol lives in bluetti_ac180p.h and the NimBLE transport in bluetti_ble.h; the
+# entities below just read from them.
 
 substitutions:
   name: bluetti
   friendly_name: Bluetti AC180P
-  ble_service: 0000ff00-0000-1000-8000-00805f9b34fb
-  ble_notify: 0000ff01-0000-1000-8000-00805f9b34fb
-  ble_write: 0000ff02-0000-1000-8000-00805f9b34fb
+  bluetti_mac: !secret bluetti__bluetti_mac
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   includes:
     - bluetti_ac180p.h
+    - bluetti_ble.h
+  on_boot:
+    then:
+      # The BLE task waits for WiFi before it connects.
+      - lambda: bluetti::ble.begin("${bluetti_mac}");
 
 esp32:
   board: esp32dev
   framework:
     type: esp-idf
+    advanced:
+      minimum_chip_revision: "3.1"
+      sram1_as_iram: true
+      flash_chip: generic
+    components:
+      - name: h2zero/esp-nimble-cpp
+        ref: 2.3.4
     sdkconfig_options:
       # Reboot on a stalled loop: the WiFi/API reboot_timeouts only help when the loop still runs.
       CONFIG_ESP_TASK_WDT_PANIC: "y"
       CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
       CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU0: "y"
       CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1: "y"
-      # Keep the BLE host/controller off core 0, where WiFi and the main loop run (the old
-      # PlatformIO firmware pinned NimBLE to core 1 too).
-      CONFIG_BT_BLUEDROID_PINNED_TO_CORE_1: "y"
-      CONFIG_BTDM_CTRL_PINNED_TO_CORE_1: "y"
+      # NimBLE host + controller, BLE only, central role, one connection.
+      CONFIG_BT_ENABLED: "y"
+      CONFIG_BT_BLE_42_FEATURES_SUPPORTED: "y"
+      CONFIG_BT_BLE_50_FEATURES_SUPPORTED: "n"
+      CONFIG_BT_BLUEDROID_ENABLED: "n"
+      CONFIG_BT_NIMBLE_ENABLED: "y"
+      CONFIG_BTDM_CTRL_MODE_BLE_ONLY: "y"
+      CONFIG_BT_NIMBLE_MAX_CONNECTIONS: "1"
+      CONFIG_BTDM_CTRL_BLE_MAX_CONN: "1"
+      # TEST: the stall happens with the controller merely initialised, so take its sleep/wake cycle
+      # out of the picture (mains powered, no need for BT modem sleep).
+      CONFIG_BTDM_CTRL_MODEM_SLEEP: "n"
+      CONFIG_BT_NIMBLE_ROLE_PERIPHERAL: "n"
+      CONFIG_BT_NIMBLE_ROLE_BROADCASTER: "n"
+      # NimBLE host on core 1. The controller stays on core 0 with WiFi.
+      CONFIG_BT_NIMBLE_PINNED_TO_CORE_1: "y"
+      # WiFi/BLE coexistence is normally requested by esp32_ble, which is not used any more.
+      CONFIG_ESP_COEX_SW_COEXIST_ENABLE: "y"
 
 logger:
-  level: INFO
+  level: DEBUG
 
 api:
   encryption:
@@ -42,50 +67,27 @@ ota:
     encryption:
 
 wifi:
-  ssid: !secret wifi_ssid
-  password: !secret wifi_password
-  power_save_mode: none
+  networks:
+    - ssid: !secret wifi_ssid
+      password: !secret wifi_password
+      bssid: !secret wifi_primary_bssid
   reboot_timeout: 5min
+  post_connect_roaming: false
 
 debug:
   update_interval: 60s
 
-# Scan lightly so WiFi keeps its share of the shared radio (the old firmware used ~20% duty).
-esp32_ble_tracker:
-  scan_parameters:
-    interval: 320ms
-    window: 30ms
-    active: false
-
-ble_client:
-  - id: bluetti_ble
-    mac_address: !secret bluetti__bluetti_mac
-    on_connect:
-      then:
-        - esp32_ble_tracker.stop_scan:
-        - lambda: |-
-            bluetti::client.on_connect(millis());
-            // 60-120 ms to leave airtime for WiFi on the shared radio.
-            esp_ble_conn_update_params_t p = {};
-            memcpy(p.bda, id(bluetti_ble)->get_remote_bda(), sizeof(esp_bd_addr_t));
-            p.min_int = 48;   // 60 ms
-            p.max_int = 96;   // 120 ms
-            p.latency = 0;
-            p.timeout = 400;  // 4 s supervision timeout
-            esp_ble_gap_update_conn_params(&p);
-            esp_coex_preference_set(ESP_COEX_PREFER_BALANCE);
-    on_disconnect:
-      then:
-        - lambda: bluetti::client.on_disconnect();
-        - esp32_ble_tracker.start_scan:
-            continuous: true  # the action defaults to one 5 min scan; reconnecting needs scanning to stay on
-
 switch:
-  - platform: ble_client
-    ble_client_id: bluetti_ble
-    id: bluetti_link
+  # Off releases the station (e.g. for the phone app); on reconnects.
+  - platform: template
     name: BLE connection
     entity_category: config
+    restore_mode: DISABLED
+    lambda: return bluetti::ble.enabled();
+    turn_on_action:
+      - lambda: bluetti::ble.set_enabled(true);
+    turn_off_action:
+      - lambda: bluetti::ble.set_enabled(false);
 
   # restore_mode DISABLED: never replay a stored state as a command to the station on boot.
   - platform: template
@@ -126,7 +128,7 @@ select:
       - Silent
       - Standard
       - Turbo
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: |-
       if (!bluetti::client.live()) return {};
       std::string m = bluetti::client.mode_label();
@@ -143,25 +145,13 @@ binary_sensor:
     lambda: return bluetti::client.live();
 
 sensor:
-  # Dummy sensor that only exists to subscribe to ff01 and hand the raw bytes to the lambda.
-  - platform: ble_client
-    type: characteristic
-    ble_client_id: bluetti_ble
-    name: Bluetti RX
-    internal: true
-    service_uuid: ${ble_service}
-    characteristic_uuid: ${ble_notify}
-    notify: true
-    update_interval: never
-    lambda: return bluetti::client.on_notify(x);
-
   - platform: template
     name: Battery
     device_class: battery
     state_class: measurement
     unit_of_measurement: "%"
     accuracy_decimals: 0
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.soc();
   - platform: template
     name: Input power
@@ -169,7 +159,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.in_w();
   - platform: template
     name: Output power
@@ -177,7 +167,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.out_w();
   - platform: template
     name: Net power
@@ -185,7 +175,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.net_w();
   - platform: template
     name: AC input power
@@ -193,7 +183,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.ac_in();
   - platform: template
     name: DC input power
@@ -201,7 +191,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.dc_in();
   - platform: template
     name: AC output power
@@ -209,7 +199,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.ac_out();
   - platform: template
     name: DC output power
@@ -217,7 +207,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.dc_out();
   - platform: template
     name: AC input voltage
@@ -225,7 +215,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: V
     accuracy_decimals: 1
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.ac_in_v();
   - platform: template
     name: Time remaining
@@ -233,13 +223,13 @@ sensor:
     state_class: measurement
     unit_of_measurement: h
     accuracy_decimals: 1
-    update_interval: 5000ms
+    update_interval: 40s
     lambda: return bluetti::client.time_h();
 
   # Diagnostics
   - platform: wifi_signal
     name: WiFi signal
-    update_interval: 30s
+    update_interval: 60s
   - platform: debug
     free:
       name: Free heap
@@ -254,20 +244,8 @@ text_sensor:
       entity_category: diagnostic
 
 interval:
-  # Request pump: one Modbus request in flight at a time.
-  - interval: 1000ms
+  - interval: 5s
     then:
-      - if:
-          condition:
-            lambda: return bluetti::client.take_disconnect();
-          then:
-            - ble_client.disconnect: bluetti_ble
-      - if:
-          condition:
-            lambda: return bluetti::client.prepare_next(millis());
-          then:
-            - ble_client.ble_write:
-                id: bluetti_ble
-                service_uuid: ${ble_service}
-                characteristic_uuid: ${ble_write}
-                value: !lambda return bluetti::client.tx;
+      - lambda: |-
+          ESP_LOGD("hb", "wifi=%d rssi=%d heap=%u", (int) wifi::global_wifi_component->is_connected(),
+                   (int) wifi::global_wifi_component->wifi_rssi(), (unsigned) esp_get_free_heap_size());
