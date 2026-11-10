@@ -1,15 +1,14 @@
 # Bluetti AC180P on ESPHome
 
-Pure-ESPHome replacement for the PlatformIO firmware in the repo root (which is left untouched, so
-you can roll back by flashing it again). No dashboard and no REST API: data goes to Home Assistant
-over the ESPHome native API (no MQTT broker, no web server).
+ESPHome config for the Bluetti AC180P. Data goes to Home Assistant over the ESPHome native API (no MQTT
+broker, no web server).
 
 - `bluetti-ac180p.yaml`: the ESPHome config
+- `bluetti_ble.h`: NimBLE (esp-nimble-cpp) central running in its own task; it holds a permanent connection and triggers a read cycle every 15 s (`POLL_MS`)
 - `bluetti_ac180p.h`: Modbus-RTU over BLE (framing, CRC16, polling) and the values/setters used by the template entities
 - `secrets.yaml.example`: copy to `secrets.yaml`
 
-No external component is needed. The EB3A project you found uses a fork of ESPHome only to feed BLE
-bytes into `modbus_controller`; here stock `ble_client` plus the header does the same job.
+No external component is needed; the two headers are pulled in through `esphome: includes:`.
 
 ## Home Assistant
 
@@ -28,4 +27,5 @@ report no state. Use the `BLE connection` switch to release the station for the 
 - The log shows the BLE connection, and then values flowing. If requests time out, the GATT service
   UUID may not be `0xFF00`; the log of the connect lists the real services.
 - Entities in HA show unknown/unavailable until the `Bluetti link` binary sensor is on.
-- If WiFi drops while BLE is connected, lower the scan duty in `esp32_ble_tracker`.
+- The BLE link is permanent. If WiFi stalls after a few minutes with the link open, check the coexistence and
+  connection-parameter settings in `bluetti-ac180p.yaml` / `bluetti_ble.h`.

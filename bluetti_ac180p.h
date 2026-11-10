@@ -19,7 +19,7 @@ static const char *const TAG = "bluetti";
 
 static const uint32_t TIMEOUT_MS = 6000;  // per request; replies get slow while WiFi hogs the radio
 static const uint32_t SETTLE_MS = 200;    // after connect (the notify subscription is already confirmed)
-static const uint32_t STALE_MS = 90000;   // data older than this reads as unknown (the link is only up briefly)
+static const uint32_t STALE_MS = 60000;   // data older than this reads as unknown (four missed polls)
 static const uint8_t MAX_FAILS = 6;       // consecutive failed core requests before dropping the link
 static const size_t WRITE_Q = 4;
 
@@ -125,7 +125,7 @@ class Client {
       const Step &s = STEPS[step_++];
       return send_(0x03, s.reg, s.qty, now, s.core);
     }
-    return false;  // cycle finished; the BLE task drops the link (see cycle_done)
+    return false;  // cycle finished; the BLE task starts the next one via begin_cycle (see cycle_done)
   }
 
   bool queue_write(uint16_t reg, uint16_t value) {

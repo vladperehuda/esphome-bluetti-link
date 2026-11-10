@@ -1,7 +1,7 @@
 #pragma once
-// NimBLE central for the Bluetti AC180P (esp-nimble-cpp). It connects, subscribes to
-// ff01, pumps one read cycle of the Modbus requests of bluetti_ac180p.h and disconnects again (or
-// stays connected, see PERSISTENT_LINK), from its own task on core 1, off the WiFi/main-loop core.
+// NimBLE central for the Bluetti AC180P (esp-nimble-cpp). It connects, subscribes to ff01 and keeps
+// the link open, pumping one read cycle of the Modbus requests of bluetti_ac180p.h every POLL_MS,
+// from its own task on core 1, off the WiFi/main-loop core. A broken link is re-established.
 
 #include <NimBLEDevice.h>
 #include <freertos/FreeRTOS.h>
@@ -22,20 +22,13 @@ static const char *const SERVICE_UUID = "0000ff00-0000-1000-8000-00805f9b34fb";
 static const char *const NOTIFY_UUID = "0000ff01-0000-1000-8000-00805f9b34fb";
 static const char *const WRITE_UUID = "0000ff02-0000-1000-8000-00805f9b34fb";
 
-// TEST: bring the NimBLE controller up but never scan or connect. Tells whether the WiFi stall needs
-// BLE radio activity or just the BLE controller running next to WiFi. Sensors stay unknown.
-static const bool CONTROLLER_ONLY_TEST = false;
-
-// An open BLE connection wedges WiFi's TX path on this board after 1-6 minutes, so the link is only
-// opened for one read cycle (~0.5 s of requests) per CYCLE_MS and dropped again.
-// PERSISTENT_LINK keeps one connection open and reads every POLL_MS; otherwise the link is opened per
-// cycle, every CYCLE_MS.
-static const bool PERSISTENT_LINK = false;
-static const uint32_t POLL_MS = 5000;
-static const uint32_t CYCLE_MS = 30000;         // time between read cycles (burst mode)
+// The link stays open. On some boards an open BLE connection has wedged WiFi's TX path after 1-6
+// minutes; the coexistence/connection-parameter settings and the reboot timeouts in the YAML mitigate that.
+static const uint32_t POLL_MS = 15000;          // time between read cycles
 static const uint32_t CYCLE_TIMEOUT_MS = 20000; // give up on a connection that never completes a cycle
 static const uint32_t PUMP_MS = 50;             // request pump period while connected
-static const uint32_t RECONNECT_MS = 10000;     // pause after a broken link, so a flapping one can't churn the radio
+static const uint32_t RECONNECT_MS = 3000;      // pause after a broken link, so a flapping one can't churn the radio
+static const uint32_t WIFI_SETTLE_MS = 15000;   // no BLE until WiFi has been up this long (DHCP/mDNS/API handshake)
 static const uint32_t BACKOFF_MIN_MS = 2000;    // failed connect attempts back off up to BACKOFF_MAX_MS
 static const uint32_t BACKOFF_MAX_MS = 30000;
 
@@ -74,40 +67,32 @@ class Link : public NimBLEClientCallbacks {
 
   void run_() {
     NimBLEDevice::init("");
-    if (CONTROLLER_ONLY_TEST) {
-      ESP_LOGW(BLE_TAG, "controller-only test: BLE is initialised but never connects");
-      for (;;) vTaskDelay(pdMS_TO_TICKS(60000));
-    }
     client_ = NimBLEDevice::createClient();
     client_->setClientCallbacks(this, false);
     client_->setConnectTimeout(10000);
-    // Relaxed connection events (60-120 ms, 4 s supervision timeout) and a light scan while
+    // Relaxed connection events (60-120 ms, 8 s supervision timeout) and a light scan while
     // connecting, to leave airtime for WiFi on the shared radio.
-    client_->setConnectionParams(48, 96, 0, 400, 320, 48);
+    client_->setConnectionParams(48, 96, 0, 800, 320, 48);
 
     uint32_t backoff = BACKOFF_MIN_MS;
-    uint32_t next_ms = 0;  // when the next read cycle is due
+    uint32_t wifi_since = 0;  // when WiFi last came up (0 = down)
     for (;;) {
-      // Keep the radio free for WiFi association: no BLE activity until WiFi is up.
-      if (!enabled_ || !wifi_up_()) {
+      // Keep the radio free for WiFi association: no BLE activity until WiFi is up and settled.
+      if (!wifi_up_()) wifi_since = 0;
+      else if (!wifi_since) wifi_since = millis() | 1;
+      if (!enabled_ || !wifi_since || millis() - wifi_since < WIFI_SETTLE_MS) {
         vTaskDelay(pdMS_TO_TICKS(500));
         continue;
       }
-      // A queued command (switch, charge mode) opens the link right away.
-      if ((int32_t) (millis() - next_ms) < 0 && !client.has_pending_writes()) {
-        vTaskDelay(pdMS_TO_TICKS(200));
-        continue;
-      }
-      const uint32_t start = millis();
       if (!connect_()) {
         vTaskDelay(pdMS_TO_TICKS(backoff));
         backoff = std::min(backoff * 2, BACKOFF_MAX_MS);
         continue;
       }
       backoff = BACKOFF_MIN_MS;
-      const bool ok = serve_();
+      serve_();
       drop_();
-      next_ms = start + (ok ? CYCLE_MS : RECONNECT_MS);
+      vTaskDelay(pdMS_TO_TICKS(RECONNECT_MS));
     }
   }
 
@@ -140,24 +125,24 @@ class Link : public NimBLEClientCallbacks {
     return true;
   }
 
-  // Runs while the link is up: one Modbus request in flight at a time. In burst mode it returns true
-  // once a cycle completed; in persistent mode it keeps cycling every POLL_MS until the link breaks.
-  bool serve_() {
+  void pump_() {
+    if (client.prepare_next(millis()) && !write_->writeValue(client.tx.data(), client.tx.size(), false)) {
+      ESP_LOGW(BLE_TAG, "write to ff02 failed");  // the request timeout counts the failure
+    }
+  }
+
+  // Runs while the link is up: one Modbus request in flight at a time, a read cycle every POLL_MS.
+  // Queued commands are served during the idle wait. Returns when the link breaks, is released or stalls.
+  void serve_() {
     uint32_t cycle_start = millis();
     while (enabled_ && client_->isConnected() && millis() - cycle_start < CYCLE_TIMEOUT_MS) {
-      if (client.take_disconnect()) return false;
-      if (client.prepare_next(millis()) && !write_->writeValue(client.tx.data(), client.tx.size(), false)) {
-        ESP_LOGW(BLE_TAG, "write to ff02 failed");  // the request timeout counts the failure
-      }
+      if (client.take_disconnect()) return;
+      pump_();
       if (client.cycle_done()) {
         ESP_LOGD(BLE_TAG, "cycle done in %u ms", (unsigned) (millis() - cycle_start));
-        if (!PERSISTENT_LINK) return true;
-        // Wait for the next period, still serving queued commands.
         while (enabled_ && client_->isConnected() && millis() - cycle_start < POLL_MS) {
-          if (client.take_disconnect()) return false;
-          if (client.prepare_next(millis()) && !write_->writeValue(client.tx.data(), client.tx.size(), false)) {
-            ESP_LOGW(BLE_TAG, "write to ff02 failed");
-          }
+          if (client.take_disconnect()) return;
+          pump_();
           vTaskDelay(pdMS_TO_TICKS(PUMP_MS));
         }
         cycle_start = millis();
@@ -166,7 +151,6 @@ class Link : public NimBLEClientCallbacks {
       }
       vTaskDelay(pdMS_TO_TICKS(PUMP_MS));
     }
-    return false;
   }
 
   void drop_() {

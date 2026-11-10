@@ -128,7 +128,9 @@ select:
       - Silent
       - Standard
       - Turbo
-    update_interval: 40s
+    # Cheap local read, no BLE traffic. Unlike the template switches (re-evaluated every loop), the select
+    # only runs its lambda on this interval, so it sets how soon a write read-back shows up in HA.
+    update_interval: 1s
     lambda: |-
       if (!bluetti::client.live()) return {};
       std::string m = bluetti::client.mode_label();
@@ -151,7 +153,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: "%"
     accuracy_decimals: 0
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.soc();
   - platform: template
     name: Input power
@@ -159,7 +161,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.in_w();
   - platform: template
     name: Output power
@@ -167,7 +169,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.out_w();
   - platform: template
     name: Net power
@@ -175,7 +177,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.net_w();
   - platform: template
     name: AC input power
@@ -183,7 +185,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.ac_in();
   - platform: template
     name: DC input power
@@ -191,7 +193,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.dc_in();
   - platform: template
     name: AC output power
@@ -199,7 +201,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.ac_out();
   - platform: template
     name: DC output power
@@ -207,7 +209,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: W
     accuracy_decimals: 0
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.dc_out();
   - platform: template
     name: AC input voltage
@@ -215,7 +217,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: V
     accuracy_decimals: 1
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.ac_in_v();
   - platform: template
     name: Time remaining
@@ -223,7 +225,7 @@ sensor:
     state_class: measurement
     unit_of_measurement: h
     accuracy_decimals: 1
-    update_interval: 40s
+    update_interval: 15s
     lambda: return bluetti::client.time_h();
 
   # Diagnostics
@@ -244,7 +246,7 @@ text_sensor:
       entity_category: diagnostic
 
 interval:
-  - interval: 5s
+  - interval: 60s
     then:
       - lambda: |-
           ESP_LOGD("hb", "wifi=%d rssi=%d heap=%u", (int) wifi::global_wifi_component->is_connected(),
